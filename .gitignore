@@ -1,11 +1,166 @@
-# 忽略所有文件
+# ============================================================
+# fl_moe_dev
+# Keep source code / configs / documentation only.
+# Ignore datasets, outputs, checkpoints, logs, caches, etc.
+# ============================================================
+
+# ------------------------------------------------------------
+# 1. Ignore everything by default
+# ------------------------------------------------------------
 *
 
-# 不忽略目录，否则 Git 无法继续匹配目录中的 Python 文件
+# Do not ignore directories themselves, so Git can continue
+# matching whitelisted files inside nested directories.
 !*/
 
-# 保留所有层级中的 Python 文件
+
+# ------------------------------------------------------------
+# 2. Source code
+# ------------------------------------------------------------
 !*.py
 
-# 保留 .gitignore 本身
+# Shell launch / experiment scripts
+!*.sh
+
+
+# ------------------------------------------------------------
+# 3. Project / environment metadata
+# ------------------------------------------------------------
 !.gitignore
+!README.md
+!README*.md
+
+!requirements.txt
+!requirements*.txt
+
+!pyproject.toml
+!setup.py
+!setup.cfg
+
+!environment.yml
+!environment.yaml
+
+
+# ------------------------------------------------------------
+# 4. Human-readable documentation
+# ------------------------------------------------------------
+!*.md
+
+
+# ------------------------------------------------------------
+# 5. Explicit configuration files
+#
+# Prefer keeping configs in dedicated directories rather than
+# globally tracking every JSON file, because output directories
+# may also contain generated config.json / summary.json files.
+# ------------------------------------------------------------
+
+# Dedicated config directories
+!configs/
+!configs/**
+
+!config/
+!config/**
+
+# Experiment source/config directories, if used
+!experiments/
+!experiments/**/*.py
+!experiments/**/*.sh
+!experiments/**/*.md
+!experiments/**/*.yaml
+!experiments/**/*.yml
+!experiments/**/*.toml
+
+
+# ------------------------------------------------------------
+# 6. Keep tests
+# ------------------------------------------------------------
+!tests/
+!tests/**/*.py
+!tests/**/*.md
+
+
+# ------------------------------------------------------------
+# 7. Always ignore generated / large / private artifacts
+# ------------------------------------------------------------
+
+# Python caches
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Test / lint caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Datasets
+data/
+dataset/
+datasets/
+
+# Federated partitions generated at runtime
+# Uncomment this only if you do NOT want the canonical partition
+# files version-controlled.
+# partitions/
+
+# Training outputs
+output/
+outputs/
+runs/
+results/
+
+# Checkpoints / model binaries
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+
+# Logs
+*.log
+logs/
+
+# Detached-run bookkeeping
+*.pid
+*.exit_code
+
+# TensorBoard / tracking
+events.out.tfevents.*
+wandb/
+mlruns/
+
+# Archives / temporary files
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
+*.tmp
+*.temp
+
+# Secrets
+.env
+.env.*
+*.pem
+*.key
+credentials*
+secrets*
