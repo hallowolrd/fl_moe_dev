@@ -21,6 +21,7 @@ import base as base
 # Import torch only after base has set CUBLAS_WORKSPACE_CONFIG.
 import torch
 import torch.nn as nn
+from pathlib import Path
 
 
 ALGORITHM_NAME = "expert_activation_frequency_weighted"
@@ -180,16 +181,43 @@ def main() -> None:
     )
 
     base.configure_reproducibility(config)
-    output_dir = base.create_output_dir(
-        config,
-        ALGORITHM_NAME,
-    )
-    logger = base.create_logger(
-        output_dir / "train.log",
-        ALGORITHM_NAME,
-    )
 
-    try:
+    if config.resume:
+        output_dir = Path(config.resume)
+        if not output_dir.is_dir():
+            raise FileNotFoundError(f"Resume directory not found: {output_dir}")
+        logger = base.create_logger(
+            output_dir / "train.log",
+            ALGORITHM_NAME,
+        )
+        base.run_experiment(
+            config,
+            output_dir,
+            logger,
+            algorithm_name=ALGORITHM_NAME,
+            local_train_fn=base.train_client,
+            server_aggregate_fn=server_aggregate,
+            local_objective_description=(
+                "Local objective: standard sample-mean cross-entropy; "
+                "optional balance loss follows base.py configuration"
+            ),
+            aggregation_description=(
+                "Shared aggregation: uniform average over all valid clients; "
+                "expert aggregation: normalized client-side activation-frequency "
+                "weights, where frequency=expert route_count / total client "
+                "route_count; per-expert weight sum=1"
+            ),
+            resume=True,
+        )
+    else:
+        output_dir = base.create_output_dir(
+            config,
+            ALGORITHM_NAME,
+        )
+        logger = base.create_logger(
+            output_dir / "train.log",
+            ALGORITHM_NAME,
+        )
         base.run_experiment(
             config,
             output_dir,
@@ -208,9 +236,6 @@ def main() -> None:
                 "route_count; per-expert weight sum=1"
             ),
         )
-    except Exception:
-        logger.exception("Experiment failed.")
-        raise
 
 
 if __name__ == "__main__":

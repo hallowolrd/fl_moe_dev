@@ -1352,6 +1352,16 @@ class ExperimentConfig:
     use_amp: bool = False
     max_grad_norm: float | None = None
 
+    # LR schedule
+    lr_schedule: str = "constant"
+    lr_min: float = 0.00005
+    warmup_rounds: int = 5
+    decay_end_round: int = 100
+
+    # Checkpoint / resume
+    checkpoint_interval: int = 0
+    resume: str = ""
+
     # 输出
     summary_window: int = 10
 
@@ -1413,6 +1423,13 @@ def parse_config(
     add("--weight-decay", type=float)
     add_bool("use_amp", "启用 CUDA AMP。")
     add("--max-grad-norm", type=float)
+
+    add("--lr-schedule", type=str, choices=["constant", "cosine"])
+    add("--lr-min", type=float)
+    add("--warmup-rounds", type=int)
+    add("--decay-end-round", type=int)
+    add("--checkpoint-interval", type=int)
+    add("--resume", type=str)
 
     add("--summary-window", type=int)
 
@@ -1508,12 +1525,67 @@ def validate_config(config: ExperimentConfig) -> None:
         raise ValueError("balance_loss_weight must be non-negative.")
     if config.learning_rate <= 0.0:
         raise ValueError("learning_rate must be greater than 0.")
+    if config.lr_schedule not in ("constant", "cosine"):
+        raise ValueError(f"lr_schedule must be 'constant' or 'cosine', got {config.lr_schedule!r}.")
+    if config.lr_min <= 0.0:
+        raise ValueError("lr_min must be greater than 0.")
+    if config.warmup_rounds < 0:
+        raise ValueError("warmup_rounds must be non-negative.")
+    if config.decay_end_round <= config.warmup_rounds:
+        raise ValueError("decay_end_round must be greater than warmup_rounds.")
+    if config.checkpoint_interval < 0:
+        raise ValueError("checkpoint_interval must be non-negative.")
     if config.momentum < 0.0 or config.weight_decay < 0.0:
         raise ValueError("momentum and weight_decay must be non-negative.")
     if config.max_grad_norm is not None and config.max_grad_norm <= 0.0:
         raise ValueError("max_grad_norm must be positive or omitted.")
     if config.summary_window <= 0:
         raise ValueError("summary_window must be greater than 0.")
+
+
+# =============================================================================
+# Stateless communication-round LR schedule
+# =============================================================================
+
+def compute_round_lr(round_idx: int, config: ExperimentConfig) -> float:
+    """
+    Stateless learning-rate function for communication round.
+
+    The effective LR depends only on the absolute round index (0-indexed
+    round_idx) and the experiment config.  No scheduler object or hidden
+    counter is required, which guarantees safe checkpoint / resume.
+
+    Round numbering convention:
+        round_number = round_idx + 1  (1-indexed, R1 … R100)
+    """
+    round_number = round_idx + 1  # 1-indexed
+
+    if config.lr_schedule == "constant":
+        return config.learning_rate
+
+    if config.lr_schedule == "cosine":
+        # --- Linear warmup ---------------------------------------------------
+        if round_number <= config.warmup_rounds:
+            if config.warmup_rounds <= 0:
+                return config.learning_rate
+            alpha = round_number / config.warmup_rounds
+            return config.learning_rate * (0.1 + 0.9 * alpha)
+
+        # --- Post-decay ------------------------------------------------------
+        if round_number >= config.decay_end_round:
+            return config.lr_min
+
+        # --- Cosine decay ----------------------------------------------------
+        total_decay_steps = config.decay_end_round - config.warmup_rounds
+        if total_decay_steps <= 0:
+            return config.lr_min
+
+        progress = (round_number - config.warmup_rounds) / total_decay_steps
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return config.lr_min + (config.learning_rate - config.lr_min) * cosine
+
+    raise ValueError(f"Unknown lr_schedule={config.lr_schedule!r}.")
+
 
 # =============================================================================
 # Data structures
@@ -2870,6 +2942,7 @@ def train_client(
     client_id: int,
     round_idx: int,
     device: torch.device,
+    learning_rate: float | None = None,
     method_state: object | None = None,
     post_local_train_statistics_fn: Callable[..., Mapping[str, object] | None] | None = None,
 ) -> ClientUpdate | None:
@@ -2885,9 +2958,10 @@ def train_client(
     global_shared = global_model.get_shared_state_dict(to_cpu=True)
     global_experts = global_model.get_all_expert_state_dicts(to_cpu=True)
 
+    effective_lr = learning_rate if learning_rate is not None else config.learning_rate
     optimizer = torch.optim.SGD(
         local_model.parameters(),
-        lr=config.learning_rate,
+        lr=effective_lr,
         momentum=config.momentum,
         weight_decay=config.weight_decay,
     )
@@ -3169,6 +3243,7 @@ def run_experiment(
     evaluate_fn: EvaluateFn = default_evaluate,
     local_objective_description: str = "",
     aggregation_description: str = "",
+    resume: bool = False,
 ) -> dict:
     device = resolve_device(config.device)
 
@@ -3203,6 +3278,45 @@ def run_experiment(
         if count == 0
     ]
 
+    # =========================================================================
+    #  Checkpoint / resume
+    # =========================================================================
+    checkpoint_path = output_dir / "checkpoint.pt"
+    start_round = 0
+    accuracy_history: list[float] = []
+    loss_history: list[float] = []
+    final_round: dict | None = None
+
+    if resume and checkpoint_path.exists():
+        logger.info("Resume checkpoint found at %s", checkpoint_path)
+        checkpoint = torch.load(
+            checkpoint_path, map_location="cpu", weights_only=False,
+        )
+
+        # Verify config is compatible (compare key fields).
+        ckpt_config = checkpoint.get("config", {})
+        for key in ("seed", "num_clients", "num_experts", "top_k",
+                     "dataset_name", "backbone_name", "dirichlet_alpha",
+                     "lr_schedule", "learning_rate", "lr_min",
+                     "warmup_rounds", "decay_end_round"):
+            expected = getattr(config, key, None)
+            actual = ckpt_config.get(key)
+            if expected != actual:
+                raise RuntimeError(
+                    f"Resume config mismatch for {key!r}: "
+                    f"expected {expected!r}, got {actual!r}."
+                )
+
+        global_model.load_state_dict(checkpoint["model_state_dict"])
+        accuracy_history = list(checkpoint["accuracy_history"])
+        loss_history = list(checkpoint["loss_history"])
+        sampling_generator.set_state(checkpoint["sampling_generator_state"])
+        start_round = int(checkpoint["round_idx"]) + 1
+        logger.info("Resumed at round %d / %d", start_round, config.num_rounds)
+
+    # =========================================================================
+    #  Save config
+    # =========================================================================
     save_json(
         output_dir / "config.json",
         {
@@ -3246,14 +3360,24 @@ def run_experiment(
     logger.info("Empty clients: %s", empty_clients)
     logger.info(
         "Training: rounds=%d | participation_rate=%s | local_epochs=%d | "
-        "client_batch_size=%d | test_batch_size=%d | learning_rate=%s",
+        "client_batch_size=%d | test_batch_size=%d | learning_rate=%s | "
+        "lr_schedule=%s",
         config.num_rounds,
         config.participation_rate,
         config.local_epochs,
         config.client_batch_size,
         config.test_batch_size,
         config.learning_rate,
+        config.lr_schedule,
     )
+    if config.lr_schedule == "cosine":
+        logger.info(
+            "LR schedule: cosine | lr_min=%s | warmup_rounds=%d | "
+            "decay_end_round=%d",
+            config.lr_min,
+            config.warmup_rounds,
+            config.decay_end_round,
+        )
     logger.info(
         "Model: backbone=%s | num_experts=%d | top_k=%d | "
         "total_parameters=%d | shared_parameters=%d | expert_parameters=%d",
@@ -3265,9 +3389,13 @@ def run_experiment(
         global_model.count_expert_parameters(),
     )
 
+    # =========================================================================
+    #  Metrics CSV
+    # =========================================================================
     metrics_path = output_dir / "metrics.csv"
     fieldnames = [
         "round",
+        "effective_lr",
         "selected_client_ids",
         "valid_client_ids",
         "num_valid_clients",
@@ -3287,18 +3415,26 @@ def run_experiment(
         "round_seconds",
     ]
 
-    accuracy_history: list[float] = []
-    loss_history: list[float] = []
-    final_round: dict | None = None
-    experiment_start = time.perf_counter()
-
-    with metrics_path.open("w", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(file, fieldnames=fieldnames)
+    if resume and checkpoint_path.exists():
+        metrics_file = metrics_path.open("a", newline="", encoding="utf-8")
+        writer = csv.DictWriter(metrics_file, fieldnames=fieldnames)
+        # Header was already written — do not write again.
+    else:
+        metrics_file = metrics_path.open("w", newline="", encoding="utf-8")
+        writer = csv.DictWriter(metrics_file, fieldnames=fieldnames)
         writer.writeheader()
 
-        for round_idx in range(config.num_rounds):
+    experiment_start = time.perf_counter()
+
+    try:
+        # =====================================================================
+        #  Main federated loop
+        # =====================================================================
+        for round_idx in range(start_round, config.num_rounds):
             round_number = round_idx + 1
+            round_lr = compute_round_lr(round_idx, config)
             round_start = time.perf_counter()
+
             selected_ids = select_clients_fn(
                 generator=sampling_generator,
                 config=config,
@@ -3333,6 +3469,7 @@ def run_experiment(
                     client_id=client_id,
                     round_idx=round_idx,
                     device=device,
+                    learning_rate=round_lr,
                     method_state=method_state,
                 )
                 if update is not None:
@@ -3389,6 +3526,7 @@ def run_experiment(
 
             row = {
                 "round": round_number,
+                "effective_lr": f"{round_lr:.8f}",
                 "selected_client_ids": json.dumps(selected_ids),
                 "valid_client_ids": json.dumps(valid_ids),
                 "num_valid_clients": len(updates),
@@ -3420,7 +3558,7 @@ def run_experiment(
                 "round_seconds": f"{round_seconds:.6f}",
             }
             writer.writerow(row)
-            file.flush()
+            metrics_file.flush()
 
             log_round(
                 logger,
@@ -3451,6 +3589,28 @@ def run_experiment(
                 "expert_client_weights": expert_client_weights,
                 "aggregation_method_metrics": aggregation_result.method_metrics,
             }
+
+            # ================================================================
+            #  Save checkpoint
+            # ================================================================
+            if config.checkpoint_interval > 0:
+                if round_number % config.checkpoint_interval == 0 or \
+                   round_number == config.num_rounds:
+                    _save_checkpoint(
+                        checkpoint_path=checkpoint_path,
+                        global_model=global_model,
+                        config=config,
+                        round_idx=round_idx,
+                        accuracy_history=accuracy_history,
+                        loss_history=loss_history,
+                        sampling_generator=sampling_generator,
+                    )
+                    logger.info(
+                        "Checkpoint saved at round %d", round_number
+                    )
+
+    finally:
+        metrics_file.close()
 
     if final_round is None:
         raise RuntimeError("No training round was completed.")
@@ -3494,3 +3654,26 @@ def run_experiment(
         format_duration(elapsed_seconds),
     )
     return summary
+
+
+def _save_checkpoint(
+    *,
+    checkpoint_path: Path,
+    global_model: nn.Module,
+    config: ExperimentConfig,
+    round_idx: int,
+    accuracy_history: list[float],
+    loss_history: list[float],
+    sampling_generator: torch.Generator,
+) -> None:
+    """Save a training checkpoint that can be resumed later."""
+    checkpoint = {
+        "config": asdict(config),
+        "round_idx": round_idx,
+        "model_state_dict": global_model.state_dict(),
+        "accuracy_history": accuracy_history,
+        "loss_history": loss_history,
+        "sampling_generator_state": sampling_generator.get_state(),
+    }
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(checkpoint, checkpoint_path)
