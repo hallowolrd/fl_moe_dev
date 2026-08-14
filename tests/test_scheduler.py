@@ -50,10 +50,29 @@ def test_constant_lr_independent_of_round():
 # ============================================================================
 
 def test_cosine_warmup_first_round():
+    """R1 must be 0.1 * lr_max (new corrected warmup)."""
     config = _make_cosine_config(lr_max=0.001, warmup_rounds=5)
     lr = compute_round_lr(0, config)  # R1
-    expected = 0.001 * (0.1 + 0.9 * 1.0 / 5.0)
+    expected = 0.001 * 0.1  # 0.0001
     assert math.isclose(lr, expected, rel_tol=1e-12), f"R1: expected {expected}, got {lr}"
+
+
+def test_cosine_warmup_exact_values():
+    """For W=5, lr_max=0.002, verify exact R1-R5 values."""
+    lr_max = 0.002
+    config = _make_cosine_config(lr_max=lr_max, warmup_rounds=5)
+    expected = [
+        lr_max * 0.100,    # R1: 0.0002
+        lr_max * 0.325,    # R2: 0.00065
+        lr_max * 0.550,    # R3: 0.00110
+        lr_max * 0.775,    # R4: 0.00155
+        lr_max * 1.000,    # R5: 0.00200
+    ]
+    for r_idx, exp in enumerate(expected):
+        lr = compute_round_lr(r_idx, config)  # r_idx 0→R1, 1→R2, ...
+        assert math.isclose(lr, exp, rel_tol=1e-12), (
+            f"R{r_idx+1}: expected {exp}, got {lr}"
+        )
 
 
 def test_cosine_warmup_final_round():
@@ -64,6 +83,7 @@ def test_cosine_warmup_final_round():
 
 
 def test_cosine_warmup_monotonic_increasing():
+    """Warmup must be strictly increasing for W=10."""
     config = _make_cosine_config(lr_max=0.002, warmup_rounds=10)
     values = [compute_round_lr(r, config) for r in range(0, 10)]
     for i in range(1, len(values)):
@@ -71,6 +91,21 @@ def test_cosine_warmup_monotonic_increasing():
             f"Warmup should be monotonic increasing: "
             f"R{i+1}={values[i]} <= R{i}={values[i-1]}"
         )
+
+
+def test_cosine_warmup_boundary_no_jump():
+    """R5 (last warmup) == lr_max, and R6 (first post-warmup) < lr_max."""
+    lr_max = 0.002
+    config = _make_cosine_config(lr_max=lr_max, lr_min=0.00005, warmup_rounds=5, decay_end_round=80)
+    lr_r5 = compute_round_lr(4, config)   # R5
+    lr_r6 = compute_round_lr(5, config)   # R6
+    assert math.isclose(lr_r5, lr_max, rel_tol=1e-12), (
+        f"R5 should equal lr_max, got {lr_r5}"
+    )
+    assert lr_r6 < lr_max, (
+        f"R6 post-warmup should be < lr_max, got {lr_r6}"
+    )
+    assert lr_r6 > 0.0, f"R6 should be positive, got {lr_r6}"
 
 
 # ============================================================================
@@ -162,6 +197,27 @@ def test_warmup_rounds_zero():
     assert lr > 0.0009, f"R1 with warmup=0 should be close to lr_max, got {lr}"
 
 
+def test_warmup_rounds_one():
+    """When warmup_rounds=1, R1 must be lr_max (only endpoint)."""
+    lr_max = 0.001
+    config = _make_cosine_config(lr_max=lr_max, lr_min=0.00005, warmup_rounds=1, decay_end_round=70)
+    # R1: warmup round, should be lr_max
+    lr_r1 = compute_round_lr(0, config)
+    assert math.isclose(lr_r1, lr_max, rel_tol=1e-12), (
+        f"R1 with warmup=1 should be lr_max, got {lr_r1}"
+    )
+    # R2: first post-warmup, should be slightly less than lr_max
+    lr_r2 = compute_round_lr(1, config)
+    assert lr_r2 < lr_max, f"R2 with warmup=1 should be < lr_max, got {lr_r2}"
+    # Verify R2 matches expected cosine decay
+    progress = 1.0 / 69.0  # (2 - 1) / (70 - 1)
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    expected = 0.00005 + (lr_max - 0.00005) * cosine
+    assert math.isclose(lr_r2, expected, rel_tol=1e-12), (
+        f"R2 with warmup=1: expected {expected}, got {lr_r2}"
+    )
+
+
 def test_decay_end_round_equals_warmup_rounds():
     """When decay_end_round == warmup_rounds, validate_config should reject."""
     config = ExperimentConfig(
@@ -191,11 +247,12 @@ def test_same_round_same_lr_across_calls():
 # ============================================================================
 
 def test_s1_lr_values():
-    """S1: lr_max=0.0015, decay_end_round=70, warmup=5, lr_min=0.00005"""
+    """S1: lr_max=0.0015, decay_end_round=70, warmup=5, lr_min=0.00005
+    (corrected warmup_v2 values)."""
     config = _make_cosine_config(lr_max=0.0015, lr_min=0.00005, warmup_rounds=5, decay_end_round=70)
-    # R1 warmup
+    # R1 warmup (corrected: 0.1 * lr_max)
     lr_r1 = compute_round_lr(0, config)
-    expected_r1 = 0.0015 * (0.1 + 0.9 * 1.0 / 5.0)
+    expected_r1 = 0.0015 * 0.1
     assert math.isclose(lr_r1, expected_r1, rel_tol=1e-12)
     # R5 end of warmup
     lr_r5 = compute_round_lr(4, config)
@@ -209,11 +266,12 @@ def test_s1_lr_values():
 
 
 def test_s4_lr_values():
-    """S4: lr_max=0.0020, decay_end_round=80, warmup=5, lr_min=0.00005"""
+    """S4: lr_max=0.0020, decay_end_round=80, warmup=5, lr_min=0.00005
+    (corrected warmup_v2 values)."""
     config = _make_cosine_config(lr_max=0.0020, lr_min=0.00005, warmup_rounds=5, decay_end_round=80)
-    # R1 warmup
+    # R1 warmup (corrected: 0.1 * lr_max)
     lr_r1 = compute_round_lr(0, config)
-    expected_r1 = 0.0020 * (0.1 + 0.9 * 1.0 / 5.0)
+    expected_r1 = 0.0020 * 0.1
     assert math.isclose(lr_r1, expected_r1, rel_tol=1e-12)
     # R5 end of warmup
     lr_r5 = compute_round_lr(4, config)
@@ -227,11 +285,12 @@ def test_s4_lr_values():
 
 
 def test_s6_lr_values():
-    """S6: lr_max=0.0025, decay_end_round=80, warmup=5, lr_min=0.00005"""
+    """S6: lr_max=0.0025, decay_end_round=80, warmup=5, lr_min=0.00005
+    (corrected warmup_v2 values)."""
     config = _make_cosine_config(lr_max=0.0025, lr_min=0.00005, warmup_rounds=5, decay_end_round=80)
-    # R1 warmup
+    # R1 warmup (corrected: 0.1 * lr_max)
     lr_r1 = compute_round_lr(0, config)
-    expected_r1 = 0.0025 * (0.1 + 0.9 * 1.0 / 5.0)
+    expected_r1 = 0.0025 * 0.1
     assert math.isclose(lr_r1, expected_r1, rel_tol=1e-12)
     # R5 end of warmup
     lr_r5 = compute_round_lr(4, config)

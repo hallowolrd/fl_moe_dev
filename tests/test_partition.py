@@ -10,6 +10,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "experiments"))
 
 import numpy as np
+import pytest
 import torch
 
 from base import (
@@ -91,12 +92,8 @@ def test_validate_partition_passes_correct_partition():
 def test_validate_partition_rejects_unequal_sizes():
     """validate_partition should reject clients with different sizes."""
     indices = [[0, 1], [2, 3, 4]]
-    # 50k total, 10 clients — but we're testing with smaller data
-    try:
+    with pytest.raises(RuntimeError):
         validate_partition(indices, 50000, 2)
-        # Might not reach the size check if dataset_size % num_clients != 0
-    except RuntimeError:
-        pass  # Expected
 
 
 def test_validate_partition_rejects_duplicates():
