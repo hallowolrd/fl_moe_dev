@@ -1331,13 +1331,13 @@ class ExperimentConfig:
 
     # Dataset split / DataLoader
     dataset_test_fraction: float = 0.2
-    client_batch_size: int = 64
+    client_batch_size: int = 32
     test_batch_size: int = 256
     drop_last: bool = False
 
     # 模型
-    num_experts: int = 4
-    top_k: int = 1
+    num_experts: int = 8
+    top_k: int = 2
     moe_dim: int = 512
     expert_hidden_dim: int = 1024
     small_image_stem: bool = True
