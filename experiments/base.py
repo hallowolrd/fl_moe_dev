@@ -1352,17 +1352,6 @@ class ExperimentConfig:
     use_amp: bool = False
     max_grad_norm: float | None = None
 
-    # LR schedule
-    lr_schedule: str = "constant"
-    lr_min: float = 0.00005
-    warmup_rounds: int = 5
-    decay_end_round: int = 100
-    lr_schedule_version: str = "warmup_v2_0p1_to_1p0"
-
-    # Checkpoint / resume
-    checkpoint_interval: int = 0
-    resume: str = ""
-
     # 输出
     summary_window: int = 10
 
@@ -1424,13 +1413,6 @@ def parse_config(
     add("--weight-decay", type=float)
     add_bool("use_amp", "启用 CUDA AMP。")
     add("--max-grad-norm", type=float)
-
-    add("--lr-schedule", type=str, choices=["constant", "cosine"])
-    add("--lr-min", type=float)
-    add("--warmup-rounds", type=int)
-    add("--decay-end-round", type=int)
-    add("--checkpoint-interval", type=int)
-    add("--resume", type=str)
 
     add("--summary-window", type=int)
 
@@ -1526,238 +1508,12 @@ def validate_config(config: ExperimentConfig) -> None:
         raise ValueError("balance_loss_weight must be non-negative.")
     if config.learning_rate <= 0.0:
         raise ValueError("learning_rate must be greater than 0.")
-    if config.lr_schedule not in ("constant", "cosine"):
-        raise ValueError(f"lr_schedule must be 'constant' or 'cosine', got {config.lr_schedule!r}.")
-    if config.lr_min <= 0.0:
-        raise ValueError("lr_min must be greater than 0.")
-    if config.warmup_rounds < 0:
-        raise ValueError("warmup_rounds must be non-negative.")
-    if config.decay_end_round <= config.warmup_rounds:
-        raise ValueError("decay_end_round must be greater than warmup_rounds.")
-    if config.checkpoint_interval < 0:
-        raise ValueError("checkpoint_interval must be non-negative.")
     if config.momentum < 0.0 or config.weight_decay < 0.0:
         raise ValueError("momentum and weight_decay must be non-negative.")
     if config.max_grad_norm is not None and config.max_grad_norm <= 0.0:
         raise ValueError("max_grad_norm must be positive or omitted.")
     if config.summary_window <= 0:
         raise ValueError("summary_window must be greater than 0.")
-
-
-# =============================================================================
-# Scientific config fingerprint and resume helpers
-# =============================================================================
-
-def scientific_config_key(config: ExperimentConfig, algorithm_name: str = "") -> dict:
-    """Return a normalized dict of all scientifically meaningful config fields.
-
-    Fields that affect model architecture, training dynamics, or data
-    partitioning are included.  Fields that are purely infrastructure
-    (output directory, logging, checkpoint interval, etc.) are excluded.
-    """
-    return {
-        "algorithm_name": algorithm_name,
-        "seed": config.seed,
-        "deterministic": config.deterministic,
-        "num_clients": config.num_clients,
-        "participation_rate": config.participation_rate,
-        "dirichlet_alpha": config.dirichlet_alpha,
-        "dataset_name": config.dataset_name,
-        "backbone_name": config.backbone_name,
-        "num_experts": config.num_experts,
-        "top_k": config.top_k,
-        "moe_dim": config.moe_dim,
-        "expert_hidden_dim": config.expert_hidden_dim,
-        "small_image_stem": config.small_image_stem,
-        "max_gn_groups": config.max_gn_groups,
-        "zero_init_residual": config.zero_init_residual,
-        "local_epochs": config.local_epochs,
-        "client_batch_size": config.client_batch_size,
-        "drop_last": config.drop_last,
-        "balance_loss_weight": config.balance_loss_weight,
-        "learning_rate": config.learning_rate,
-        "lr_schedule": config.lr_schedule,
-        "lr_schedule_version": config.lr_schedule_version,
-        "lr_min": config.lr_min,
-        "warmup_rounds": config.warmup_rounds,
-        "decay_end_round": config.decay_end_round,
-        "momentum": config.momentum,
-        "weight_decay": config.weight_decay,
-        "use_amp": config.use_amp,
-        "max_grad_norm": config.max_grad_norm,
-    }
-
-
-def compute_scientific_config_hash(
-    config: ExperimentConfig, algorithm_name: str = ""
-) -> str:
-    """Stable SHA-256 of the scientific config via sorted-JSON canonicalization."""
-    key = scientific_config_key(config, algorithm_name)
-    canonical = json.dumps(key, sort_keys=True, ensure_ascii=True, default=str)
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-
-
-def _truncate_metrics(
-    metrics_path: Path, completed_round: int, fieldnames: list[str]
-) -> None:
-    """Remove metrics rows with round > completed_round before resume.
-
-    This handles the case where the process crashed after writing metrics
-    for a later round but before the next checkpoint was saved.
-    """
-    if not metrics_path.exists():
-        return
-    with open(metrics_path, "r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        rows = list(reader)
-
-    # Keep header row (round <= completed_round) and data rows with round <= completed_round
-    kept_rows = [row for row in rows if int(row["round"]) <= completed_round]
-
-    if len(kept_rows) == len(rows):
-        return  # Nothing to truncate
-
-    with open(metrics_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(kept_rows)
-
-
-# =============================================================================
-# Formal routing-health and convergence classification
-# =============================================================================
-
-def classify_routing_health(
-    expert_participant_history: list[list[int]],
-    num_experts: int,
-    num_rounds_for_health: int = 10,
-) -> dict:
-    """Classify routing health based on the last N rounds of expert participant counts.
-
-    Returns a dict with:
-        ROUTING_HEALTHY (bool)
-        zero_participant_round_count (list[int]) — per expert
-        longest_consecutive_zero_streak (list[int]) — per expert
-        final10_zero_participant_count (list[int]) — per expert
-    """
-    if not expert_participant_history:
-        return {
-            "ROUTING_HEALTHY": False,
-            "zero_participant_round_count": [0] * num_experts,
-            "longest_consecutive_zero_streak": [0] * num_experts,
-            "final10_zero_participant_count": [0] * num_experts,
-        }
-
-    recent = expert_participant_history[-num_rounds_for_health:]
-
-    zero_counts = [0] * num_experts
-    longest_streaks = [0] * num_experts
-    current_streaks = [0] * num_experts
-    final10_zeros = [0] * num_experts
-
-    for round_participants in recent:
-        for e in range(num_experts):
-            pc = round_participants[e] if e < len(round_participants) else 0
-            if pc == 0:
-                zero_counts[e] += 1
-                current_streaks[e] += 1
-                if current_streaks[e] > longest_streaks[e]:
-                    longest_streaks[e] = current_streaks[e]
-            else:
-                current_streaks[e] = 0
-
-    # Final 10 counts
-    for e in range(num_experts):
-        final10_zeros[e] = zero_counts[e]
-
-    # Routing is healthy if no expert has zero participants for ALL of the last 10 rounds
-    routing_healthy = all(zero_counts[e] < num_rounds_for_health for e in range(num_experts))
-
-    return {
-        "ROUTING_HEALTHY": routing_healthy,
-        "zero_participant_round_count": zero_counts,
-        "longest_consecutive_zero_streak": longest_streaks,
-        "final10_zero_participant_count": final10_zeros,
-    }
-
-
-def classify_optimization_stable(
-    last10_std: float,
-    last10_slope: float,
-    final_accuracy: float,
-    last10_mean: float,
-    best_accuracy: float,
-    std_threshold: float = 2.0,
-    slope_threshold: float = 0.20,
-    final_deviation_threshold: float = 3.0,
-    best_deviation_threshold: float = 5.0,
-) -> bool:
-    """Check whether optimization is stable (no NaN, low variance, converged).
-
-    Default thresholds per the formal protocol.
-    """
-    # Check for NaN / Inf
-    if any(
-        not math.isfinite(v)
-        for v in [last10_std, last10_slope, final_accuracy, last10_mean, best_accuracy]
-    ):
-        return False
-
-    return (
-        last10_std <= std_threshold
-        and abs(last10_slope) <= slope_threshold
-        and abs(final_accuracy - last10_mean) <= final_deviation_threshold
-        and final_accuracy >= best_accuracy - best_deviation_threshold
-    )
-
-
-# =============================================================================
-# Stateless communication-round LR schedule
-# =============================================================================
-
-def compute_round_lr(round_idx: int, config: ExperimentConfig) -> float:
-    """
-    Stateless learning-rate function for communication round.
-
-    The effective LR depends only on the absolute round index (0-indexed
-    round_idx) and the experiment config.  No scheduler object or hidden
-    counter is required, which guarantees safe checkpoint / resume.
-
-    Round numbering convention:
-        round_number = round_idx + 1  (1-indexed, R1 … R100)
-    """
-    round_number = round_idx + 1  # 1-indexed
-
-    if config.lr_schedule == "constant":
-        return config.learning_rate
-
-    if config.lr_schedule == "cosine":
-        # --- Linear warmup ---------------------------------------------------
-        if round_number <= config.warmup_rounds:
-            if config.warmup_rounds <= 0:
-                return config.learning_rate
-            if config.warmup_rounds == 1:
-                # Single warmup round: only the endpoint (lr_max).
-                return config.learning_rate
-            # True linear interpolation from 0.1*lr_max (R1) to 1.0*lr_max (R_W).
-            alpha = (round_number - 1) / (config.warmup_rounds - 1)
-            return config.learning_rate * (0.1 + 0.9 * alpha)
-
-        # --- Post-decay ------------------------------------------------------
-        if round_number >= config.decay_end_round:
-            return config.lr_min
-
-        # --- Cosine decay ----------------------------------------------------
-        total_decay_steps = config.decay_end_round - config.warmup_rounds
-        if total_decay_steps <= 0:
-            return config.lr_min
-
-        progress = (round_number - config.warmup_rounds) / total_decay_steps
-        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-        return config.lr_min + (config.learning_rate - config.lr_min) * cosine
-
-    raise ValueError(f"Unknown lr_schedule={config.lr_schedule!r}.")
-
 
 # =============================================================================
 # Data structures
@@ -2932,34 +2688,6 @@ def validate_partition(indices: list[list[int]], dataset_size: int, num_clients:
         raise RuntimeError("Partition contains out-of-range indices.")
 
 
-def _save_client_class_distribution(
-    output_dir: Path,
-    train_dataset: Dataset,
-    client_indices: list[list[int]],
-    num_classes: int,
-    num_clients: int,
-) -> None:
-    """Compute and save the per-client class distribution matrix.
-
-    Produces a num_clients × num_classes matrix saved as JSON.
-    """
-    labels = get_dataset_targets(train_dataset)
-    matrix = np.zeros((num_clients, num_classes), dtype=np.int64)
-    for client_id, indices in enumerate(client_indices):
-        for idx in indices:
-            label = int(labels[idx])
-            if 0 <= label < num_classes:
-                matrix[client_id, label] += 1
-    client_sample_counts = [int(matrix[c].sum()) for c in range(num_clients)]
-    records = {
-        "num_clients": num_clients,
-        "num_classes": num_classes,
-        "client_sample_counts": client_sample_counts,
-        "class_distribution_matrix": matrix.tolist(),
-    }
-    save_json(output_dir / "client_class_distribution.json", records)
-
-
 def load_or_create_partition(
     config: ExperimentConfig,
     train_dataset: Dataset,
@@ -3142,7 +2870,6 @@ def train_client(
     client_id: int,
     round_idx: int,
     device: torch.device,
-    learning_rate: float | None = None,
     method_state: object | None = None,
     post_local_train_statistics_fn: Callable[..., Mapping[str, object] | None] | None = None,
 ) -> ClientUpdate | None:
@@ -3158,10 +2885,9 @@ def train_client(
     global_shared = global_model.get_shared_state_dict(to_cpu=True)
     global_experts = global_model.get_all_expert_state_dicts(to_cpu=True)
 
-    effective_lr = learning_rate if learning_rate is not None else config.learning_rate
     optimizer = torch.optim.SGD(
         local_model.parameters(),
-        lr=effective_lr,
+        lr=config.learning_rate,
         momentum=config.momentum,
         weight_decay=config.weight_decay,
     )
@@ -3443,7 +3169,6 @@ def run_experiment(
     evaluate_fn: EvaluateFn = default_evaluate,
     local_objective_description: str = "",
     aggregation_description: str = "",
-    resume: bool = False,
 ) -> dict:
     device = resolve_device(config.device)
 
@@ -3478,109 +3203,6 @@ def run_experiment(
         if count == 0
     ]
 
-    # =========================================================================
-    #  Metrics CSV (defined early so truncation can reference it)
-    # =========================================================================
-    metrics_path = output_dir / "metrics.csv"
-    fieldnames = [
-        "round",
-        "effective_lr",
-        "selected_client_ids",
-        "valid_client_ids",
-        "num_valid_clients",
-        "mean_client_loss",
-        "mean_client_standard_classification_loss",
-        "mean_client_balance_loss",
-        "mean_client_accuracy",
-        "test_total_loss",
-        "test_classification_loss",
-        "test_balance_loss",
-        "test_accuracy",
-        "test_route_counts",
-        "test_route_distribution",
-        "client_route_counts",
-        "client_activation_frequencies",
-        "direct_expert_rho",
-        "expert_participant_counts",
-        "expert_client_weights",
-        "aggregation_method_metrics",
-        "round_seconds",
-    ]
-
-    # =========================================================================
-    #  Checkpoint / resume
-    # =========================================================================
-    checkpoint_path = output_dir / "checkpoint.pt"
-    start_round = 0
-    accuracy_history: list[float] = []
-    loss_history: list[float] = []
-    expert_participant_history: list[list[int]] = []
-    final_round: dict | None = None
-
-    if resume and checkpoint_path.exists():
-        logger.info("Resume checkpoint found at %s", checkpoint_path)
-        checkpoint = torch.load(
-            checkpoint_path, map_location="cpu", weights_only=False,
-        )
-
-        # Verify config is compatible (compare all scientific fields).
-        ckpt_config = checkpoint.get("config", {})
-        ckpt_algo = checkpoint.get("algorithm_name", "")
-        ckpt_sci = checkpoint.get("scientific_config", None)
-        if ckpt_sci is not None:
-            # Use the pre-computed scientific config for comparison.
-            expected_sci = scientific_config_key(config, algorithm_name)
-            for key, expected_val in expected_sci.items():
-                actual_val = ckpt_sci.get(key)
-                if expected_val != actual_val:
-                    raise RuntimeError(
-                        f"Resume config mismatch for {key!r}: "
-                        f"expected {expected_val!r}, got {actual_val!r}."
-                    )
-        else:
-            # Fallback: compare individual fields (legacy checkpoints).
-            _RESUME_COMPAT_KEYS = (
-                "seed", "num_clients", "num_experts", "top_k",
-                "dataset_name", "backbone_name", "dirichlet_alpha",
-                "lr_schedule", "learning_rate", "lr_min",
-                "warmup_rounds", "decay_end_round",
-                "lr_schedule_version", "balance_loss_weight",
-                "local_epochs", "client_batch_size", "drop_last",
-                "momentum", "weight_decay", "use_amp",
-                "moe_dim", "expert_hidden_dim", "small_image_stem",
-                "max_gn_groups", "zero_init_residual", "participation_rate",
-            )
-            for key in _RESUME_COMPAT_KEYS:
-                expected = getattr(config, key, None)
-                actual = ckpt_config.get(key)
-                if expected != actual:
-                    raise RuntimeError(
-                        f"Resume config mismatch for {key!r}: "
-                        f"expected {expected!r}, got {actual!r}."
-                    )
-            # Also verify algorithm identity.
-            if ckpt_algo and ckpt_algo != algorithm_name:
-                raise RuntimeError(
-                    f"Resume algorithm mismatch: checkpoint has {ckpt_algo!r}, "
-                    f"current is {algorithm_name!r}."
-                )
-
-        # Truncate metrics.csv to remove rows with round > completed_round
-        # (handles crash-after-metrics-write-before-checkpoint case).
-        completed_round = int(checkpoint["round_idx"]) + 1  # 1-indexed
-        _truncate_metrics(metrics_path, completed_round, fieldnames)
-
-        global_model.load_state_dict(checkpoint["model_state_dict"])
-        accuracy_history = list(checkpoint["accuracy_history"])
-        loss_history = list(checkpoint["loss_history"])
-        expert_participant_history = list(checkpoint.get("expert_participant_history", []))
-        sampling_generator.set_state(checkpoint["sampling_generator_state"])
-        start_round = int(checkpoint["round_idx"]) + 1
-        logger.info("Resumed at round %d / %d", start_round, config.num_rounds)
-
-    # =========================================================================
-    #  Save config
-    # =========================================================================
     save_json(
         output_dir / "config.json",
         {
@@ -3622,39 +3244,16 @@ def run_experiment(
     )
     logger.info("Client sample counts: %s", client_sample_counts)
     logger.info("Empty clients: %s", empty_clients)
-
-    # =========================================================================
-    #  Save client class distribution (once per experiment)
-    # =========================================================================
-    _save_client_class_distribution(
-        output_dir=output_dir,
-        train_dataset=train_dataset,
-        client_indices=client_indices,
-        num_classes=num_classes,
-        num_clients=config.num_clients,
-    )
-
     logger.info(
         "Training: rounds=%d | participation_rate=%s | local_epochs=%d | "
-        "client_batch_size=%d | test_batch_size=%d | learning_rate=%s | "
-        "lr_schedule=%s",
+        "client_batch_size=%d | test_batch_size=%d | learning_rate=%s",
         config.num_rounds,
         config.participation_rate,
         config.local_epochs,
         config.client_batch_size,
         config.test_batch_size,
         config.learning_rate,
-        config.lr_schedule,
     )
-    if config.lr_schedule == "cosine":
-        logger.info(
-            "LR schedule: cosine | lr_min=%s | warmup_rounds=%d | "
-            "decay_end_round=%d | version=%s",
-            config.lr_min,
-            config.warmup_rounds,
-            config.decay_end_round,
-            config.lr_schedule_version,
-        )
     logger.info(
         "Model: backbone=%s | num_experts=%d | top_k=%d | "
         "total_parameters=%d | shared_parameters=%d | expert_parameters=%d",
@@ -3666,26 +3265,40 @@ def run_experiment(
         global_model.count_expert_parameters(),
     )
 
-    if resume and checkpoint_path.exists():
-        metrics_file = metrics_path.open("a", newline="", encoding="utf-8")
-        writer = csv.DictWriter(metrics_file, fieldnames=fieldnames)
-        # Header was already written — do not write again.
-    else:
-        metrics_file = metrics_path.open("w", newline="", encoding="utf-8")
-        writer = csv.DictWriter(metrics_file, fieldnames=fieldnames)
-        writer.writeheader()
+    metrics_path = output_dir / "metrics.csv"
+    fieldnames = [
+        "round",
+        "selected_client_ids",
+        "valid_client_ids",
+        "num_valid_clients",
+        "mean_client_loss",
+        "mean_client_standard_classification_loss",
+        "mean_client_balance_loss",
+        "mean_client_accuracy",
+        "test_total_loss",
+        "test_classification_loss",
+        "test_balance_loss",
+        "test_accuracy",
+        "test_route_counts",
+        "test_route_distribution",
+        "expert_participant_counts",
+        "expert_client_weights",
+        "aggregation_method_metrics",
+        "round_seconds",
+    ]
 
+    accuracy_history: list[float] = []
+    loss_history: list[float] = []
+    final_round: dict | None = None
     experiment_start = time.perf_counter()
 
-    try:
-        # =====================================================================
-        #  Main federated loop
-        # =====================================================================
-        for round_idx in range(start_round, config.num_rounds):
-            round_number = round_idx + 1
-            round_lr = compute_round_lr(round_idx, config)
-            round_start = time.perf_counter()
+    with metrics_path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer.writeheader()
 
+        for round_idx in range(config.num_rounds):
+            round_number = round_idx + 1
+            round_start = time.perf_counter()
             selected_ids = select_clients_fn(
                 generator=sampling_generator,
                 config=config,
@@ -3720,7 +3333,6 @@ def run_experiment(
                     client_id=client_id,
                     round_idx=round_idx,
                     device=device,
-                    learning_rate=round_lr,
                     method_state=method_state,
                 )
                 if update is not None:
@@ -3746,31 +3358,6 @@ def run_experiment(
                 )
             expert_participants = aggregation_result.expert_participants
             expert_client_weights = aggregation_result.expert_client_weights
-            expert_participant_history.append(expert_participants)
-
-            # ================================================================
-            #  Per-client routing diagnostics
-            # ================================================================
-            # client_route_counts: num_valid_clients × num_experts matrix
-            client_route_counts = [
-                update.route_counts.tolist() for update in updates
-            ]
-            # client_activation_frequencies: normalized per-client frequencies
-            client_activation_frequencies = []
-            for update in updates:
-                total = int(update.route_counts.sum().item())
-                if total > 0:
-                    freqs = [float(c) / total for c in update.route_counts.tolist()]
-                else:
-                    freqs = [0.0] * config.num_experts
-                client_activation_frequencies.append(freqs)
-
-            # Direct expert rho: active_client_count / K_valid per expert
-            num_valid = len(updates)
-            direct_expert_rho = [
-                float(pc) / float(num_valid) if num_valid > 0 else 0.0
-                for pc in expert_participants
-            ]
 
             test_metrics = evaluate_fn(
                 global_model=global_model,
@@ -3802,7 +3389,6 @@ def run_experiment(
 
             row = {
                 "round": round_number,
-                "effective_lr": f"{round_lr:.8f}",
                 "selected_client_ids": json.dumps(selected_ids),
                 "valid_client_ids": json.dumps(valid_ids),
                 "num_valid_clients": len(updates),
@@ -3822,14 +3408,6 @@ def run_experiment(
                 "test_route_distribution": json.dumps(
                     [round(float(value), 8) for value in test_metrics.route_distribution]
                 ),
-                "client_route_counts": json.dumps(client_route_counts),
-                "client_activation_frequencies": json.dumps(
-                    client_activation_frequencies,
-                    sort_keys=False,
-                ),
-                "direct_expert_rho": json.dumps(
-                    [round(rho, 6) for rho in direct_expert_rho]
-                ),
                 "expert_participant_counts": json.dumps(expert_participants),
                 "expert_client_weights": json.dumps(
                     expert_client_weights,
@@ -3842,7 +3420,7 @@ def run_experiment(
                 "round_seconds": f"{round_seconds:.6f}",
             }
             writer.writerow(row)
-            metrics_file.flush()
+            file.flush()
 
             log_round(
                 logger,
@@ -3857,17 +3435,6 @@ def run_experiment(
                 expert_participants=expert_participants,
                 round_seconds=round_seconds,
             )
-
-            # ================================================================
-            #  Lightweight update-norm diagnostics (every 10 rounds + final)
-            # ================================================================
-            if round_number % 10 == 0 or round_number == config.num_rounds:
-                _save_update_norm_diagnostics(
-                    output_dir=output_dir,
-                    round_number=round_number,
-                    updates=updates,
-                    num_experts=config.num_experts,
-                )
 
             accuracy_history.append(test_metrics.accuracy)
             loss_history.append(test_metrics.total_loss)
@@ -3884,30 +3451,6 @@ def run_experiment(
                 "expert_client_weights": expert_client_weights,
                 "aggregation_method_metrics": aggregation_result.method_metrics,
             }
-
-            # ================================================================
-            #  Save checkpoint
-            # ================================================================
-            if config.checkpoint_interval > 0:
-                if round_number % config.checkpoint_interval == 0 or \
-                   round_number == config.num_rounds:
-                    _save_checkpoint(
-                        checkpoint_path=checkpoint_path,
-                        global_model=global_model,
-                        config=config,
-                        round_idx=round_idx,
-                        accuracy_history=accuracy_history,
-                        loss_history=loss_history,
-                        expert_participant_history=expert_participant_history,
-                        sampling_generator=sampling_generator,
-                        algorithm_name=algorithm_name,
-                    )
-                    logger.info(
-                        "Checkpoint saved at round %d", round_number
-                    )
-
-    finally:
-        metrics_file.close()
 
     if final_round is None:
         raise RuntimeError("No training round was completed.")
@@ -3937,26 +3480,6 @@ def run_experiment(
         },
         "elapsed_seconds": elapsed_seconds,
     }
-
-    # Add routing-health classification
-    routing_health = classify_routing_health(
-        expert_participant_history,
-        config.num_experts,
-        num_rounds_for_health=min(config.summary_window, len(expert_participant_history)),
-    )
-    optimization_stable = classify_optimization_stable(
-        last10_std=std_accuracy,
-        last10_slope=0.0,  # slope approximation not computed here
-        final_accuracy=final_accuracy,
-        last10_mean=mean_accuracy,
-        best_accuracy=best_accuracy,
-    )
-    summary["routing_health"] = routing_health
-    summary["optimization_stable"] = optimization_stable
-    summary["FORMAL_CONVERGED"] = (
-        routing_health["ROUTING_HEALTHY"] and optimization_stable
-    )
-
     save_json(output_dir / "summary.json", summary)
 
     logger.info(
@@ -3971,91 +3494,3 @@ def run_experiment(
         format_duration(elapsed_seconds),
     )
     return summary
-
-
-def _save_update_norm_diagnostics(
-    *,
-    output_dir: Path,
-    round_number: int,
-    updates: list[ClientUpdate],
-    num_experts: int,
-) -> None:
-    """Save scalar L2 norms of client/expert/parameter deltas every 10 rounds.
-
-    Diagnostics are scalars only — no full tensors are saved.
-    """
-    per_client_expert_norms: list[dict] = []
-    for update in updates:
-        expert_norms = {}
-        for e in range(num_experts):
-            norms = []
-            for t in update.expert_deltas[e].values():
-                if torch.is_floating_point(t):
-                    norms.append(float(t.norm().item()))
-            expert_norms[f"expert_{e}"] = (
-                float(sum(norms)) if norms else 0.0
-            )
-        # Shared delta norm
-        shared_norms = [
-            float(t.norm().item())
-            for t in update.shared_delta.values()
-            if torch.is_floating_point(t)
-        ]
-        per_client_expert_norms.append({
-            "client_id": update.client_id,
-            "shared_norm": float(sum(shared_norms)) if shared_norms else 0.0,
-            **expert_norms,
-        })
-
-    # Aggregate expert norms (sum of all client deltas per expert)
-    # and shared norm (sum of all client shared deltas).
-    shared_global_norm = 0.0
-    expert_global_norms = [0.0] * num_experts
-    for update in updates:
-        for t in update.shared_delta.values():
-            if torch.is_floating_point(t):
-                shared_global_norm += float(t.norm().item())
-        for e in range(num_experts):
-            for t in update.expert_deltas[e].values():
-                if torch.is_floating_point(t):
-                    expert_global_norms[e] += float(t.norm().item())
-
-    diagnostics = {
-        "round": round_number,
-        "shared_global_norm": shared_global_norm,
-        "expert_global_norms": expert_global_norms,
-        "per_client": per_client_expert_norms,
-    }
-
-    diag_dir = output_dir / "diagnostics"
-    diag_dir.mkdir(parents=True, exist_ok=True)
-    save_json(diag_dir / f"update_norms_round_{round_number:04d}.json", diagnostics)
-
-
-def _save_checkpoint(
-    *,
-    checkpoint_path: Path,
-    global_model: nn.Module,
-    config: ExperimentConfig,
-    round_idx: int,
-    accuracy_history: list[float],
-    loss_history: list[float],
-    expert_participant_history: list[list[int]] | None = None,
-    sampling_generator: torch.Generator,
-    algorithm_name: str = "",
-) -> None:
-    """Save a training checkpoint that can be resumed later."""
-    checkpoint = {
-        "config": asdict(config),
-        "algorithm_name": algorithm_name,
-        "scientific_config": scientific_config_key(config, algorithm_name),
-        "scientific_config_hash": compute_scientific_config_hash(config, algorithm_name),
-        "round_idx": round_idx,
-        "model_state_dict": global_model.state_dict(),
-        "accuracy_history": accuracy_history,
-        "loss_history": loss_history,
-        "expert_participant_history": expert_participant_history or [],
-        "sampling_generator_state": sampling_generator.get_state(),
-    }
-    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(checkpoint, checkpoint_path)
