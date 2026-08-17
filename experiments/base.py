@@ -1334,7 +1334,7 @@ class ExperimentConfig:
     client_batch_size: int = 32
     test_batch_size: int = 256
     drop_last: bool = False
-    train_augmentation: str = "standard"
+    train_augmentation: str = "none"
 
     # 模型
     num_experts: int = 8
