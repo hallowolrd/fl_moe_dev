@@ -1334,6 +1334,7 @@ class ExperimentConfig:
     client_batch_size: int = 32
     test_batch_size: int = 256
     drop_last: bool = False
+    train_augmentation: str = "standard"
 
     # 模型
     num_experts: int = 8
@@ -1398,6 +1399,11 @@ def parse_config(
     add("--client-batch-size", type=int)
     add("--test-batch-size", type=int)
     add_bool("drop_last", "客户端训练是否丢弃最后一个不完整 batch。")
+    add(
+        "--train-augmentation",
+        type=str,
+        choices=("standard", "none"),
+    )
 
     add("--num-experts", type=int)
     add("--top-k", type=int)
@@ -1496,6 +1502,17 @@ def validate_config(config: ExperimentConfig) -> None:
         raise ValueError("dataset_test_fraction must be in (0, 1).")
     if config.client_batch_size <= 0 or config.test_batch_size <= 0:
         raise ValueError("batch sizes must be greater than 0.")
+    if config.train_augmentation not in {"standard", "none"}:
+        raise ValueError(
+            "train_augmentation must be 'standard' or 'none'."
+        )
+    if (
+        config.train_augmentation == "none"
+        and canonical_dataset_name(config.dataset_name) != "cifar10"
+    ):
+        raise ValueError(
+            "train_augmentation='none' is currently supported for CIFAR-10 only."
+        )
     if config.num_experts <= 0:
         raise ValueError("num_experts must be greater than 0.")
     if not 1 <= config.top_k <= config.num_experts:
@@ -1836,13 +1853,29 @@ def dataset_input_channels(dataset_name: str) -> int:
     return 1 if dataset_name in {"fashion_mnist", "usps", "femnist"} else 3
 
 
-def _dataset_transforms(dataset_name: str) -> tuple[Callable, Callable]:
+def _dataset_transforms(
+    dataset_name: str,
+    train_augmentation: str = "standard",
+) -> tuple[Callable, Callable]:
     dataset_name = canonical_dataset_name(dataset_name)
 
+    if train_augmentation not in {"standard", "none"}:
+        raise ValueError(
+            "train_augmentation must be 'standard' or 'none'."
+        )
+
     if dataset_name == "cifar10":
-        # Keep the original CIFAR-10 transform path exactly unchanged.
         mean_values = (0.4914, 0.4822, 0.4465)
         std_values = (0.2470, 0.2435, 0.2616)
+
+        test_transform = transforms.Compose(
+            [transforms.ToTensor(), transforms.Normalize(mean_values, std_values)]
+        )
+
+        if train_augmentation == "none":
+            return test_transform, test_transform
+
+        # Preserve the original CIFAR-10 training augmentation exactly.
         train_transform = transforms.Compose(
             [
                 transforms.RandomCrop(32, padding=4),
@@ -1851,10 +1884,12 @@ def _dataset_transforms(dataset_name: str) -> tuple[Callable, Callable]:
                 transforms.Normalize(mean_values, std_values),
             ]
         )
-        test_transform = transforms.Compose(
-            [transforms.ToTensor(), transforms.Normalize(mean_values, std_values)]
-        )
         return train_transform, test_transform
+
+    if train_augmentation != "standard":
+        raise ValueError(
+            "train_augmentation='none' is currently supported for CIFAR-10 only."
+        )
 
     if dataset_name == "cifar100":
         mean_values = (0.5071, 0.4867, 0.4408)
@@ -2372,7 +2407,10 @@ def build_datasets(config: ExperimentConfig) -> tuple[Dataset, Dataset]:
     data_dir = project_path(config.data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
     dataset_name = canonical_dataset_name(config.dataset_name)
-    train_transform, test_transform = _dataset_transforms(dataset_name)
+    train_transform, test_transform = _dataset_transforms(
+        dataset_name,
+        train_augmentation=config.train_augmentation,
+    )
 
     if dataset_name == "cifar10":
         # Preserve the original CIFAR-10 root and constructor calls exactly.
