@@ -9,20 +9,22 @@ client training, evaluation, logging and federated round loop are provided by
 base.py.
 
 Method-specific behavior kept here:
-1. After standard local CE training, run one extra deterministic/no-augmentation,
-   FP32 forward/backward pass with standard sample-mean CE to collect per-expert,
-   per-Linear KFAC factors without updating parameters.
-2. Convert expert deltas to pseudo-gradients D = -Delta / eta.
+1. During standard local CE training, record each processed sample occurrence's
+   exact Top-k expert indices and original Top-k routing probabilities.
+2. After local training, run one extra deterministic/no-augmentation FP32
+   forward/backward pass, forcing those recorded routes and probabilities, to
+   collect per-expert, per-Linear KFAC factors without updating parameters.
+4. Convert expert deltas to pseudo-gradients D = -Delta / eta.
 3. Whiten each client/layer pseudo-gradient with that client's damped local
    KFAC factors.
-4. Build a self-included route-count-weighted reference from valid KFAC
+5. Build a self-included route-count-weighted reference from valid KFAC
    clients only.
-5. If the whitened gradient conflicts with the reference (negative inner
+6. If the whitened gradient conflicts with the reference (negative inner
    product), remove exactly its negative reference component.
-6. Map the corrected whitened gradient back with the same local KFAC factors.
-7. Aggregate all training-active clients by training-stage route counts;
+7. Map the corrected whitened gradient back with the same local KFAC factors.
+8. Aggregate all training-active clients by training-stage route counts;
    invalid KFAC clients keep their original pseudo-gradient.
-8. Shared/non-expert parameters remain uniformly averaged across valid
+9. Shared/non-expert parameters remain uniformly averaged across valid
    clients via base.aggregate_shared_uniform().
 
 Run from the project root with the current shared base saved as
@@ -206,6 +208,56 @@ class ExpertAggregationResult:
     diagnostics: list[dict]
 
 
+@dataclass
+class RouteReplayRecord:
+    """Exact training-time routing for one processed sample occurrence."""
+
+    sample_index: int
+    topk_indices: Tensor
+    topk_probabilities: Tensor
+
+
+class IndexedClientDataset(Dataset):
+    """Client subset that additionally returns the original dataset index."""
+
+    def __init__(self, dataset: Dataset, indices: list[int]) -> None:
+        self.dataset = dataset
+        self.indices = [int(index) for index in indices]
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def __getitem__(self, position: int):
+        sample_index = self.indices[position]
+        image, target = self.dataset[sample_index]
+        return image, target, sample_index
+
+
+class RouteReplayDataset(Dataset):
+    """Deterministic Fisher view paired with recorded training routes."""
+
+    def __init__(
+        self,
+        fisher_dataset: Dataset,
+        records: list[RouteReplayRecord],
+    ) -> None:
+        self.fisher_dataset = fisher_dataset
+        self.records = records
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def __getitem__(self, position: int):
+        record = self.records[position]
+        image, target = self.fisher_dataset[record.sample_index]
+        return (
+            image,
+            target,
+            record.topk_indices,
+            record.topk_probabilities,
+        )
+
+
 # =============================================================================
 # Post-local-training, no-augmentation KFAC collection
 # =============================================================================
@@ -239,12 +291,27 @@ def build_fisher_dataset(
     return fisher_dataset
 
 
+def make_indexed_client_loader(
+    *,
+    config: base.ExperimentConfig,
+    train_dataset: Dataset,
+    indices: list[int],
+) -> DataLoader:
+    """Match base.make_client_loader while also returning sample indices."""
+    return DataLoader(
+        IndexedClientDataset(train_dataset, indices),
+        batch_size=config.client_batch_size,
+        shuffle=True,
+        drop_last=config.drop_last,
+    )
+
+
 def make_fisher_loader(
     *,
     config: base.ExperimentConfig,
     settings: KFACSettings,
     fisher_dataset: Dataset,
-    indices: list[int],
+    route_replay_records: list[RouteReplayRecord],
 ) -> DataLoader:
     batch_size = (
         config.client_batch_size
@@ -252,7 +319,7 @@ def make_fisher_loader(
         else settings.fisher_batch_size
     )
     return DataLoader(
-        Subset(fisher_dataset, indices),
+        RouteReplayDataset(fisher_dataset, route_replay_records),
         batch_size=batch_size,
         shuffle=False,
         drop_last=False,
@@ -452,6 +519,66 @@ class ExpertKFACCollector:
             )
 
 
+def forward_with_replayed_routes(
+    *,
+    model: nn.Module,
+    images: Tensor,
+    replay_topk_indices: Tensor,
+    replay_topk_probabilities: Tensor,
+    num_experts: int,
+) -> tuple[Tensor, Tensor]:
+    """Forward experts using exact training-time Top-k assignments and weights."""
+    if not hasattr(model, "extract_features") or not hasattr(
+        model, "_dispatch_to_experts"
+    ):
+        raise TypeError(
+            "Route replay requires the shared SparseMoEClassifier interface."
+        )
+
+    features = model.extract_features(images)
+    replay_topk_indices = replay_topk_indices.to(
+        device=features.device, dtype=torch.long
+    )
+    replay_topk_probabilities = replay_topk_probabilities.to(
+        device=features.device, dtype=features.dtype
+    )
+
+    if replay_topk_indices.ndim != 2:
+        raise RuntimeError(
+            "Replayed topk_indices must have shape [B, k], got "
+            f"{tuple(replay_topk_indices.shape)}."
+        )
+    if replay_topk_probabilities.shape != replay_topk_indices.shape:
+        raise RuntimeError(
+            "Replayed topk probabilities/indices have different shapes: "
+            f"{tuple(replay_topk_probabilities.shape)} vs "
+            f"{tuple(replay_topk_indices.shape)}."
+        )
+    if replay_topk_indices.shape[0] != features.shape[0]:
+        raise RuntimeError(
+            "Replay batch size does not match feature batch size."
+        )
+    if bool(
+        ((replay_topk_indices < 0) | (replay_topk_indices >= num_experts))
+        .any()
+        .item()
+    ):
+        raise RuntimeError("Replayed topk_indices contain an invalid expert id.")
+    if not bool(torch.isfinite(replay_topk_probabilities).all().item()):
+        raise RuntimeError("Replayed topk_probabilities contain non-finite values.")
+
+    logits = model._dispatch_to_experts(
+        features=features,
+        topk_probabilities=replay_topk_probabilities,
+        topk_indices=replay_topk_indices,
+    )
+    route_counts = torch.bincount(
+        replay_topk_indices.reshape(-1),
+        minlength=num_experts,
+    )
+    return logits, route_counts
+
+
 def estimate_expert_kfac_factors(
     *,
     model: nn.Module,
@@ -459,28 +586,41 @@ def estimate_expert_kfac_factors(
     device: torch.device,
     num_experts: int,
 ) -> tuple[list[dict[str, KFACLayerFactors]], Tensor]:
-    """Freeze the locally trained model and collect one FP32 KFAC pass."""
+    """Freeze the local model and collect one FP32 KFAC pass with route replay."""
     was_training = model.training
     model.to(device)
     model.eval()
     route_counts = torch.zeros(num_experts, dtype=torch.long, device=device)
     collector = ExpertKFACCollector(model, num_experts)
     try:
-        for images, targets in loader:
+        for (
+            images,
+            targets,
+            replay_topk_indices,
+            replay_topk_probabilities,
+        ) in loader:
             images = images.to(device)
             targets = targets.to(device)
             batch_size = int(targets.size(0))
             model.zero_grad(set_to_none=True)
             collector.set_batch_size(batch_size)
             with torch.autocast(device_type=device.type, enabled=False):
-                output = model(images.float())
+                logits, batch_route_counts = forward_with_replayed_routes(
+                    model=model,
+                    images=images.float(),
+                    replay_topk_indices=replay_topk_indices,
+                    replay_topk_probabilities=replay_topk_probabilities,
+                    num_experts=num_experts,
+                )
                 classification_loss = F.cross_entropy(
-                    output.logits.float(),
+                    logits.float(),
                     targets,
                 )
             classification_loss.backward()
             route_counts.add_(
-                output.route_counts.detach().to(device=device, dtype=torch.long)
+                batch_route_counts.detach().to(
+                    device=device, dtype=torch.long
+                )
             )
 
         factors = collector.mean_factors()
@@ -491,7 +631,7 @@ def estimate_expert_kfac_factors(
                 observed = collector.layer_count(expert_idx, layer_name)
                 if observed != expected:
                     raise RuntimeError(
-                        "KFAC hook count does not match model route count: "
+                        "KFAC hook count does not match replayed route count: "
                         f"expert={expert_idx}, layer={layer_name}, "
                         f"hook_count={observed}, route_count={expected}."
                     )
@@ -515,21 +655,15 @@ def collect_post_training_kfac_statistics(
     *,
     settings: KFACSettings,
     local_model: nn.Module,
-    global_model: nn.Module,
-    loader: DataLoader,
     train_dataset: Dataset,
-    client_indices: list[int],
+    route_replay_records: list[RouteReplayRecord],
+    training_route_counts: Tensor,
     config: base.ExperimentConfig,
-    client_id: int,
-    round_idx: int,
     device: torch.device,
-    method_state: object | None,
 ) -> Mapping[str, object]:
-    del global_model, loader, client_id, round_idx, method_state
-
-    # base.train_client has already frozen shared_delta/expert_deltas before
-    # invoking this hook. The state check below additionally verifies that the
-    # statistics pass itself is parameter-state preserving.
+    # The actual client deltas are frozen before this function is called. The
+    # state checks below additionally verify that the replay/KFAC pass itself
+    # cannot change the locally trained model parameters.
     shared_before = local_model.get_shared_state_dict(to_cpu=True)
     experts_before = local_model.get_all_expert_state_dicts(to_cpu=True)
 
@@ -538,7 +672,7 @@ def collect_post_training_kfac_statistics(
         config=config,
         settings=settings,
         fisher_dataset=fisher_dataset,
-        indices=client_indices,
+        route_replay_records=route_replay_records,
     )
     kfac_factors, fisher_route_counts = estimate_expert_kfac_factors(
         model=local_model,
@@ -546,6 +680,14 @@ def collect_post_training_kfac_statistics(
         device=device,
         num_experts=config.num_experts,
     )
+
+    expected_route_counts = training_route_counts.detach().cpu().to(torch.long)
+    if not torch.equal(fisher_route_counts.to(torch.long), expected_route_counts):
+        raise RuntimeError(
+            "Strict route replay failed: Fisher route counts differ from "
+            f"training route counts. training={expected_route_counts.tolist()}, "
+            f"fisher={fisher_route_counts.tolist()}."
+        )
 
     shared_after = local_model.get_shared_state_dict(to_cpu=True)
     experts_after = local_model.get_all_expert_state_dicts(to_cpu=True)
@@ -568,16 +710,194 @@ def collect_post_training_kfac_statistics(
     }
 
 
+def train_client_with_route_replay(
+    *,
+    settings: KFACSettings,
+    config: base.ExperimentConfig,
+    global_model: nn.Module,
+    train_dataset: Dataset,
+    client_indices: list[int],
+    client_id: int,
+    round_idx: int,
+    device: torch.device,
+    method_state: object | None = None,
+) -> ClientUpdate | None:
+    """base.train_client equivalent plus strict sample-occurrence route replay."""
+    del method_state
+    if not client_indices:
+        return None
+
+    client_seed = base.derive_seed(
+        config.seed, "client_round", round_idx, client_id
+    )
+    base.seed_all(client_seed)
+    loader = make_indexed_client_loader(
+        config=config,
+        train_dataset=train_dataset,
+        indices=client_indices,
+    )
+
+    local_model = copy.deepcopy(global_model).to(device)
+    local_model.train()
+    global_shared = global_model.get_shared_state_dict(to_cpu=True)
+    global_experts = global_model.get_all_expert_state_dicts(to_cpu=True)
+
+    optimizer = torch.optim.SGD(
+        local_model.parameters(),
+        lr=config.learning_rate,
+        momentum=config.momentum,
+        weight_decay=config.weight_decay,
+    )
+    amp_enabled = config.use_amp and device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
+
+    total_loss = 0.0
+    total_standard_classification_loss = 0.0
+    total_balance_loss = 0.0
+    total_correct = 0
+    total_processed = 0
+    route_counts = torch.zeros(
+        config.num_experts, dtype=torch.long, device=device
+    )
+    route_replay_records: list[RouteReplayRecord] = []
+
+    for _ in range(config.local_epochs):
+        for images, targets, sample_indices in loader:
+            images = images.to(device)
+            targets = targets.to(device)
+            optimizer.zero_grad(set_to_none=True)
+
+            with torch.autocast(
+                device_type=device.type,
+                dtype=torch.float16,
+                enabled=amp_enabled,
+            ):
+                output = local_model(images)
+                standard_classification_loss = F.cross_entropy(
+                    output.logits,
+                    targets,
+                )
+                loss = (
+                    standard_classification_loss
+                    + config.balance_loss_weight * output.balance_loss
+                )
+
+            replay_indices_cpu = output.topk_indices.detach().cpu().clone()
+            replay_probabilities_cpu = (
+                output.topk_probabilities.detach().cpu().clone()
+            )
+            sample_indices_list = [int(value) for value in sample_indices.tolist()]
+            if replay_indices_cpu.shape[0] != len(sample_indices_list):
+                raise RuntimeError(
+                    "Training route record batch size does not match sample indices."
+                )
+            for position, sample_index in enumerate(sample_indices_list):
+                route_replay_records.append(
+                    RouteReplayRecord(
+                        sample_index=sample_index,
+                        topk_indices=replay_indices_cpu[position].clone(),
+                        topk_probabilities=(
+                            replay_probabilities_cpu[position].clone()
+                        ),
+                    )
+                )
+
+            scaler.scale(loss).backward()
+            if config.max_grad_norm is not None:
+                scaler.unscale_(optimizer)
+                nn.utils.clip_grad_norm_(
+                    local_model.parameters(), config.max_grad_norm
+                )
+            scaler.step(optimizer)
+            scaler.update()
+
+            batch_size = targets.size(0)
+            total_processed += batch_size
+            total_loss += float(loss.detach().item()) * batch_size
+            total_standard_classification_loss += (
+                float(standard_classification_loss.detach().item()) * batch_size
+            )
+            total_balance_loss += (
+                float(output.balance_loss.detach().item()) * batch_size
+            )
+            total_correct += int(
+                output.logits.argmax(dim=1).eq(targets).sum().item()
+            )
+            route_counts += output.route_counts.detach().to(
+                device=device, dtype=torch.long
+            )
+
+    if total_processed == 0:
+        return None
+
+    if len(route_replay_records) != total_processed:
+        raise RuntimeError(
+            "Route replay record count does not match processed sample count: "
+            f"records={len(route_replay_records)}, processed={total_processed}."
+        )
+
+    recorded_route_counts = torch.zeros(
+        config.num_experts, dtype=torch.long
+    )
+    for record in route_replay_records:
+        recorded_route_counts += torch.bincount(
+            record.topk_indices.to(torch.long),
+            minlength=config.num_experts,
+        )
+    if not torch.equal(recorded_route_counts, route_counts.detach().cpu()):
+        raise RuntimeError(
+            "Recorded replay routes do not match training route counts. "
+            f"recorded={recorded_route_counts.tolist()}, "
+            f"training={route_counts.detach().cpu().tolist()}."
+        )
+
+    local_shared = local_model.get_shared_state_dict(to_cpu=True)
+    local_experts = local_model.get_all_expert_state_dicts(to_cpu=True)
+
+    # Freeze the actual uploaded client update before the statistics pass,
+    # exactly as base.train_client does.
+    shared_delta = base.state_delta(local_shared, global_shared)
+    expert_deltas = [
+        base.state_delta(local_experts[e], global_experts[e])
+        for e in range(config.num_experts)
+    ]
+
+    method_payload = dict(
+        collect_post_training_kfac_statistics(
+            settings=settings,
+            local_model=local_model,
+            train_dataset=train_dataset,
+            route_replay_records=route_replay_records,
+            training_route_counts=route_counts,
+            config=config,
+            device=device,
+        )
+    )
+
+    update = ClientUpdate(
+        client_id=client_id,
+        num_examples=len(client_indices),
+        num_processed_examples=total_processed,
+        shared_delta=shared_delta,
+        expert_deltas=expert_deltas,
+        route_counts=route_counts.cpu(),
+        train_loss=total_loss / total_processed,
+        standard_classification_loss=(
+            total_standard_classification_loss / total_processed
+        ),
+        balance_loss=total_balance_loss / total_processed,
+        accuracy=total_correct / total_processed,
+        method_payload=method_payload,
+    )
+    del local_model, optimizer, scaler
+    return update
+
+
 def make_local_train_fn(settings: KFACSettings) -> Callable[..., ClientUpdate | None]:
     def local_train_kfac(**kwargs) -> ClientUpdate | None:
-        return base.train_client(
+        return train_client_with_route_replay(
+            settings=settings,
             **kwargs,
-            post_local_train_statistics_fn=lambda **hook_kwargs: (
-                collect_post_training_kfac_statistics(
-                    settings=settings,
-                    **hook_kwargs,
-                )
-            ),
         )
 
     return local_train_kfac
@@ -1540,13 +1860,16 @@ def main() -> None:
             "kfac_collection_data_augmentation": False,
             "kfac_collection_updates_parameters": False,
             "kfac_collection_loss": "standard_sample_mean_cross_entropy",
+            "training_route_replay_scope": "processed_sample_occurrence",
+            "training_route_replay_topk_indices": True,
+            "training_route_replay_topk_probabilities": True,
             "supports_top_k_1_and_2": True,
             "kfac_reference_includes_self": True,
             "kfac_reference_valid_clients_only": True,
             "kfac_invalid_policy": (
                 "exclude_from_reference_keep_original_in_final"
             ),
-            "training_route_replay": False,
+            "training_route_replay": True,
             "parameter_correction_cap": None,
         },
     )
@@ -1561,6 +1884,7 @@ def main() -> None:
 
     logger.info(
         "Local KFAC: post_training_extra_pass=True | fp32=True | "
+        "route_replay=strict_sample_occurrence_indices_and_probabilities | "
         "loss=standard_sample_mean_ce | fisher_batch_size=%s | "
         "minimum_samples=%d | relative_damping=%s | max_whitening_gain=%s | "
         "kfac_server_device=%s | eigendecomposition=cpu_float64",
@@ -1589,7 +1913,8 @@ def main() -> None:
                 "strict negative projection in whitened coordinates; "
                 "client-specific unwhitening with the same damped KFAC map; "
                 "invalid KFAC keeps original pseudo-gradient; final aggregation "
-                "uses training-stage route counts; no replay; no correction cap"
+                "uses training-stage route counts; strict training-route replay of "
+                "sample-occurrence Top-k indices and probabilities; no correction cap"
             ),
         )
     except Exception:
