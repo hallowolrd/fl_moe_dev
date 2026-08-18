@@ -1100,6 +1100,72 @@ def safe_stats(values: list[float]) -> dict[str, float | int]:
     }
 
 
+def cosine_distribution_stats(values: list[float]) -> dict[str, float | int]:
+    """Pure diagnostic summary for cosine values; never used by aggregation."""
+    finite = [float(value) for value in values if math.isfinite(float(value))]
+    if not finite:
+        return {
+            "count": 0,
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "p01": 0.0,
+            "p05": 0.0,
+            "p10": 0.0,
+            "p25": 0.0,
+            "median": 0.0,
+            "p75": 0.0,
+            "p90": 0.0,
+            "max": 0.0,
+            "fraction_lt_0_00": 0.0,
+            "fraction_lt_0_05": 0.0,
+            "fraction_lt_0_10": 0.0,
+            "fraction_lt_0_20": 0.0,
+            "fraction_lt_0_30": 0.0,
+        }
+
+    array = np.asarray(finite, dtype=np.float64)
+    return {
+        "count": int(array.size),
+        "mean": float(array.mean()),
+        "std": float(array.std()),
+        "min": float(array.min()),
+        "p01": float(np.quantile(array, 0.01)),
+        "p05": float(np.quantile(array, 0.05)),
+        "p10": float(np.quantile(array, 0.10)),
+        "p25": float(np.quantile(array, 0.25)),
+        "median": float(np.quantile(array, 0.50)),
+        "p75": float(np.quantile(array, 0.75)),
+        "p90": float(np.quantile(array, 0.90)),
+        "max": float(array.max()),
+        "fraction_lt_0_00": float(np.mean(array < 0.00)),
+        "fraction_lt_0_05": float(np.mean(array < 0.05)),
+        "fraction_lt_0_10": float(np.mean(array < 0.10)),
+        "fraction_lt_0_20": float(np.mean(array < 0.20)),
+        "fraction_lt_0_30": float(np.mean(array < 0.30)),
+    }
+
+
+def pairwise_whitened_cosines(
+    geometries: Mapping[int, LocalLayerGeometry],
+    *,
+    epsilon: float,
+) -> list[float]:
+    """Pairwise client cosine diagnostics for one expert/layer (i < j once)."""
+    ordered = [geometries[position] for position in sorted(geometries)]
+    cosines: list[float] = []
+    for left_idx in range(len(ordered)):
+        for right_idx in range(left_idx + 1, len(ordered)):
+            cosine = tensor_cosine(
+                ordered[left_idx].whitened,
+                ordered[right_idx].whitened,
+                epsilon,
+            )
+            if math.isfinite(cosine):
+                cosines.append(float(cosine))
+    return cosines
+
+
 def factor_transform_summary(transform: FactorTransform) -> dict[str, float | bool]:
     return {
         "scale_mean_eigenvalue": transform.scale,
@@ -1419,6 +1485,25 @@ def aggregate_experts_local_kfac_layer_projection(
                 reference_norm_squared = 0.0
                 reference_valid = False
 
+            # Pure diagnostics only. These values never participate in the
+            # conflict criterion, projection, unwhitening, or final aggregation.
+            reference_cosines_diagnostic: list[float] = []
+            if reference is not None and reference_valid:
+                for geometry in geometries.values():
+                    diagnostic_cosine = tensor_cosine(
+                        geometry.whitened,
+                        reference,
+                        settings.projection_epsilon,
+                    )
+                    if math.isfinite(diagnostic_cosine):
+                        reference_cosines_diagnostic.append(
+                            float(diagnostic_cosine)
+                        )
+            pairwise_cosines_diagnostic = pairwise_whitened_cosines(
+                geometries,
+                epsilon=settings.projection_epsilon,
+            )
+
             corrected_layer_gradients = [
                 gradient.detach().clone() for gradient in client_layer_gradients
             ]
@@ -1601,8 +1686,19 @@ def aggregate_experts_local_kfac_layer_projection(
                 "reference_norm": reference_norm,
                 "reference_norm_squared": reference_norm_squared,
                 "reference_valid": reference_valid,
+                "active_client_fraction_over_updates": (
+                    float(active_count) / float(len(updates))
+                    if updates
+                    else 0.0
+                ),
                 "projection_scalar": safe_stats(projection_scalars),
                 "whitened_cosine": safe_stats(whitened_cosines),
+                "reference_cosine_distribution": cosine_distribution_stats(
+                    reference_cosines_diagnostic
+                ),
+                "pairwise_client_cosine_distribution": cosine_distribution_stats(
+                    pairwise_cosines_diagnostic
+                ),
                 "whitened_correction_ratio": safe_stats(
                     whitened_correction_ratios
                 ),
@@ -1697,6 +1793,18 @@ def summarize_round_diagnostics(
     layer_cosines: list[float] = []
     gain_cap_rates: list[float] = []
     max_roundtrip = 0.0
+    reference_cosine_count = 0
+    reference_cosine_lt_0 = 0.0
+    reference_cosine_lt_005 = 0.0
+    reference_cosine_lt_010 = 0.0
+    reference_cosine_lt_020 = 0.0
+    reference_cosine_lt_030 = 0.0
+    pairwise_cosine_count = 0
+    pairwise_cosine_lt_0 = 0.0
+    pairwise_cosine_lt_005 = 0.0
+    pairwise_cosine_lt_010 = 0.0
+    pairwise_cosine_lt_020 = 0.0
+    pairwise_cosine_lt_030 = 0.0
 
     for expert in diagnostics:
         for layer in expert.get("layers", {}).values():
@@ -1713,6 +1821,45 @@ def summarize_round_diagnostics(
                 mapped_max_ratios.append(float(mapped.get("max", 0.0)))
             roundtrip = layer.get("roundtrip_relative_error", {})
             max_roundtrip = max(max_roundtrip, float(roundtrip.get("max", 0.0)))
+
+            reference_stats = layer.get("reference_cosine_distribution", {})
+            reference_count = int(reference_stats.get("count", 0))
+            reference_cosine_count += reference_count
+            reference_cosine_lt_0 += reference_count * float(
+                reference_stats.get("fraction_lt_0_00", 0.0)
+            )
+            reference_cosine_lt_005 += reference_count * float(
+                reference_stats.get("fraction_lt_0_05", 0.0)
+            )
+            reference_cosine_lt_010 += reference_count * float(
+                reference_stats.get("fraction_lt_0_10", 0.0)
+            )
+            reference_cosine_lt_020 += reference_count * float(
+                reference_stats.get("fraction_lt_0_20", 0.0)
+            )
+            reference_cosine_lt_030 += reference_count * float(
+                reference_stats.get("fraction_lt_0_30", 0.0)
+            )
+
+            pairwise_stats = layer.get("pairwise_client_cosine_distribution", {})
+            pairwise_count = int(pairwise_stats.get("count", 0))
+            pairwise_cosine_count += pairwise_count
+            pairwise_cosine_lt_0 += pairwise_count * float(
+                pairwise_stats.get("fraction_lt_0_00", 0.0)
+            )
+            pairwise_cosine_lt_005 += pairwise_count * float(
+                pairwise_stats.get("fraction_lt_0_05", 0.0)
+            )
+            pairwise_cosine_lt_010 += pairwise_count * float(
+                pairwise_stats.get("fraction_lt_0_10", 0.0)
+            )
+            pairwise_cosine_lt_020 += pairwise_count * float(
+                pairwise_stats.get("fraction_lt_0_20", 0.0)
+            )
+            pairwise_cosine_lt_030 += pairwise_count * float(
+                pairwise_stats.get("fraction_lt_0_30", 0.0)
+            )
+
             for client in layer.get("clients", []):
                 if (
                     int(client.get("training_route_count", 0)) > 0
@@ -1747,6 +1894,58 @@ def summarize_round_diagnostics(
         ),
         "gain_cap_trigger_rate": (
             float(np.mean(gain_cap_rates)) if gain_cap_rates else 0.0
+        ),
+        "reference_cosine_count": reference_cosine_count,
+        "reference_cosine_fraction_lt_0_00": (
+            reference_cosine_lt_0 / float(reference_cosine_count)
+            if reference_cosine_count > 0
+            else 0.0
+        ),
+        "reference_cosine_fraction_lt_0_05": (
+            reference_cosine_lt_005 / float(reference_cosine_count)
+            if reference_cosine_count > 0
+            else 0.0
+        ),
+        "reference_cosine_fraction_lt_0_10": (
+            reference_cosine_lt_010 / float(reference_cosine_count)
+            if reference_cosine_count > 0
+            else 0.0
+        ),
+        "reference_cosine_fraction_lt_0_20": (
+            reference_cosine_lt_020 / float(reference_cosine_count)
+            if reference_cosine_count > 0
+            else 0.0
+        ),
+        "reference_cosine_fraction_lt_0_30": (
+            reference_cosine_lt_030 / float(reference_cosine_count)
+            if reference_cosine_count > 0
+            else 0.0
+        ),
+        "pairwise_cosine_count": pairwise_cosine_count,
+        "pairwise_cosine_fraction_lt_0_00": (
+            pairwise_cosine_lt_0 / float(pairwise_cosine_count)
+            if pairwise_cosine_count > 0
+            else 0.0
+        ),
+        "pairwise_cosine_fraction_lt_0_05": (
+            pairwise_cosine_lt_005 / float(pairwise_cosine_count)
+            if pairwise_cosine_count > 0
+            else 0.0
+        ),
+        "pairwise_cosine_fraction_lt_0_10": (
+            pairwise_cosine_lt_010 / float(pairwise_cosine_count)
+            if pairwise_cosine_count > 0
+            else 0.0
+        ),
+        "pairwise_cosine_fraction_lt_0_20": (
+            pairwise_cosine_lt_020 / float(pairwise_cosine_count)
+            if pairwise_cosine_count > 0
+            else 0.0
+        ),
+        "pairwise_cosine_fraction_lt_0_30": (
+            pairwise_cosine_lt_030 / float(pairwise_cosine_count)
+            if pairwise_cosine_count > 0
+            else 0.0
         ),
         "max_roundtrip_relative_error": max_roundtrip,
     }
