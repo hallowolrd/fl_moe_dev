@@ -1325,7 +1325,7 @@ class ExperimentConfig:
     # 联邦学习
     num_clients: int = 10
     participation_rate: float = 1.0
-    num_rounds: int = 200
+    num_rounds: int = 50
     local_epochs: int = 1
     dirichlet_alpha: float = 0.1
 
@@ -1347,9 +1347,9 @@ class ExperimentConfig:
     balance_loss_weight: float = 0.0
 
     # 本地优化
-    learning_rate: float = 0.001
-    momentum: float = 0.9
-    weight_decay: float = 5e-4
+    learning_rate: float = 0.005
+    momentum: float = 0.5
+    weight_decay: float = 0
     use_amp: bool = False
     max_grad_norm: float | None = None
 
